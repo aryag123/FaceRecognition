@@ -1,18 +1,19 @@
 // ===== ImagePreprocessor.java =====
 package com.example;
 
-import org.bytedeco.opencv.opencv_core.Mat;
-import org.bytedeco.opencv.opencv_core.Size;
-import org.bytedeco.opencv.opencv_core.Rect;
-import org.bytedeco.opencv.opencv_core.RectVector;
-import org.bytedeco.opencv.opencv_core.Point2f;
-import org.bytedeco.opencv.opencv_objdetect.CascadeClassifier;
+import java.io.File;
+
+import org.bytedeco.javacpp.indexer.DoubleIndexer;
+import org.bytedeco.javacpp.indexer.FloatIndexer;
+import org.bytedeco.opencv.global.opencv_core;
 import org.bytedeco.opencv.global.opencv_imgcodecs;
 import org.bytedeco.opencv.global.opencv_imgproc;
-import org.bytedeco.opencv.global.opencv_core;
-import org.bytedeco.javacpp.indexer.FloatIndexer;
-import org.bytedeco.javacpp.indexer.DoubleIndexer;
-import java.io.File;
+import org.bytedeco.opencv.opencv_core.Mat;
+import org.bytedeco.opencv.opencv_core.Point2f;
+import org.bytedeco.opencv.opencv_core.Rect;
+import org.bytedeco.opencv.opencv_core.RectVector;
+import org.bytedeco.opencv.opencv_core.Size;
+import org.bytedeco.opencv.opencv_objdetect.CascadeClassifier;
 
 public class ImagePreprocessor {
 
@@ -21,13 +22,30 @@ public class ImagePreprocessor {
     public static final int CHANNELS = 3;
 
     private static CascadeClassifier faceDetector;
+    private static ONNXFaceDetector onnxFaceDetector;
     private static FaceLandmarkDetector landmarkDetector;
+    private static boolean useOnnxDetector = false;
 
-    // Initialize face detector (call this once at startup)
+    // Initialize face detector using XML cascade (call this once at startup)
     public static void initFaceDetector(String cascadePath) {
         faceDetector = new CascadeClassifier(cascadePath);
         if (faceDetector.empty()) {
             throw new RuntimeException("Failed to load face detector from: " + cascadePath);
+        }
+        useOnnxDetector = false;
+    }
+
+    // Initialize face detector using ONNX model (e.g., RetinaFace)
+    public static void initOnnxFaceDetector(String onnxModelPath) throws Exception {
+        onnxFaceDetector = new ONNXFaceDetector(onnxModelPath);
+        useOnnxDetector = true;
+    }
+
+    // Cleanup ONNX face detector
+    public static void closeOnnxFaceDetector() throws Exception {
+        if (onnxFaceDetector != null) {
+            onnxFaceDetector.close();
+            onnxFaceDetector = null;
         }
     }
 
@@ -67,6 +85,9 @@ public class ImagePreprocessor {
             if (faceRect == null) {
                 throw new IllegalArgumentException("No face detected in image: " + imagePath);
             }
+            
+            // Export detected face rectangle as image
+            exportFaceRectangle(image, faceRect, imagePath);
 
             // Align face using estimated landmarks (landmark detector is disabled due to issues)
             Mat alignedFace = alignFace(image, faceRect);
@@ -82,7 +103,13 @@ public class ImagePreprocessor {
                     // Standard preprocessing: (pixel - 127.5) / 128.0
                     // This converts [0, 255] to approximately [-1, 1] range
                     alignedFace.convertTo(normalized, opencv_core.CV_32FC3, 1.0 / 128.0, -127.5 / 128.0);
-                    return convertHWCtoCHW(normalized);
+                
+                    float[] result = convertHWCtoCHW(normalized);
+                    
+                    // Export final processed array as image
+                    exportFinalArray(result, imagePath);
+                    
+                    return result;
                 } finally {
                     normalized.release();
                 }
@@ -99,6 +126,53 @@ public class ImagePreprocessor {
      * Returns null if no face detected.
      */
     private static Rect detectFaceRect(Mat image) {
+        if (useOnnxDetector) {
+            return detectFaceRectOnnx(image);
+        } else {
+            return detectFaceRectCascade(image);
+        }
+    }
+
+    /**
+     * Detects face using ONNX model (e.g., RetinaFace).
+     */
+    private static Rect detectFaceRectOnnx(Mat image) {
+        if (onnxFaceDetector == null) {
+            throw new IllegalStateException("ONNX face detector not initialized. Call initOnnxFaceDetector() first.");
+        }
+
+        try {
+            java.util.List<Rect> faces = onnxFaceDetector.detectFaces(image);
+            
+            if (faces == null || faces.isEmpty()) {
+                return null; // No face found
+            }
+
+            // Get the largest face (in case multiple detected)
+            Rect largestFace = faces.get(0);
+            for (int i = 1; i < faces.size(); i++) {
+                Rect face = faces.get(i);
+                if (face.width() * face.height() > largestFace.width() * largestFace.height()) {
+                    largestFace = face;
+                }
+            }
+
+            return largestFace;
+        } catch (Exception e) {
+            // If ONNX detection fails, fall back to cascade if available
+            System.err.println("ONNX face detection failed: " + e.getMessage());
+            System.err.println("Falling back to XML cascade detector...");
+            if (faceDetector != null) {
+                return detectFaceRectCascade(image);
+            }
+            throw new RuntimeException("ONNX face detection failed and no cascade fallback available: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Detects face using XML cascade classifier.
+     */
+    private static Rect detectFaceRectCascade(Mat image) {
         if (faceDetector == null) {
             throw new IllegalStateException("Face detector not initialized. Call initFaceDetector() first.");
         }
@@ -109,9 +183,17 @@ public class ImagePreprocessor {
             opencv_imgproc.cvtColor(image, gray, opencv_imgproc.COLOR_BGR2GRAY);
             opencv_imgproc.equalizeHist(gray, gray);
 
-            // Detect faces
+            // Detect faces with optimized parameters for better accuracy
             RectVector faces = new RectVector();
-            faceDetector.detectMultiScale(gray, faces);
+            faceDetector.detectMultiScale(
+                gray,
+                faces,
+                1.05,        // scaleFactor: try 1.03–1.10 for better accuracy
+                5,           // minNeighbors: tune between ~3–8
+                0,           // flags
+                new Size(30, 30), // minSize
+                new Size()        // maxSize (0,0 means no explicit max)
+            );
 
             if (faces.size() == 0) {
                 return null; // No face found
@@ -329,5 +411,148 @@ public class ImagePreprocessor {
 
         indexer.close();
         return chwData;
+    }
+
+    /**
+     * Gets the export folder path for a given image path.
+     * Creates a peer folder of ReferencePhotos (ExportedImages) with subfolders.
+     * @param originalImagePath The path to the original image
+     * @param subfolderType Either "face_rectangles" or "final_processed"
+     * @return The full path to the export folder
+     */
+    private static String getExportFolderPath(String originalImagePath, String subfolderType) {
+        File originalFile = new File(originalImagePath);
+        String originalPath = originalFile.getAbsolutePath();
+        
+        // Check if the image is within ReferencePhotos folder
+        String personName = "Input"; // Default for images outside ReferencePhotos
+        if (originalPath.contains("ReferencePhotos")) {
+            // Extract person name (the folder name that's a child of ReferencePhotos)
+            File currentDir = originalFile.getParentFile();
+            while (currentDir != null) {
+                String parentName = currentDir.getName();
+                File parentParent = currentDir.getParentFile();
+                if (parentParent != null && parentParent.getName().equals("ReferencePhotos")) {
+                    personName = parentName;
+                    break;
+                }
+                currentDir = parentParent;
+            }
+        }
+        
+        // Get the parent of ReferencePhotos (or project root)
+        // ReferencePhotos is typically at: /path/to/project/ReferencePhotos
+        // So we want: /path/to/project/ExportedImages/subfolderType/personName
+        File imageFile = new File(originalImagePath);
+        File current = imageFile.getParentFile();
+        String exportBasePath = null;
+        
+        // Try to find ReferencePhotos parent, otherwise use project root
+        while (current != null) {
+            File[] siblings = current.listFiles();
+            if (siblings != null) {
+                for (File sibling : siblings) {
+                    if (sibling.getName().equals("ReferencePhotos") && sibling.isDirectory()) {
+                        exportBasePath = current.getAbsolutePath();
+                        break;
+                    }
+                }
+            }
+            if (exportBasePath != null) break;
+            current = current.getParentFile();
+        }
+        
+        // Fallback: use the parent of the image file if we can't find ReferencePhotos
+        if (exportBasePath == null) {
+            exportBasePath = imageFile.getParentFile().getAbsolutePath();
+        }
+        
+        // Build export path: base/ExportedImages/subfolderType/personName
+        String exportPath = exportBasePath + File.separator + "ExportedImages" + 
+                           File.separator + subfolderType + File.separator + personName;
+        
+        // Create directories if they don't exist
+        File exportDir = new File(exportPath);
+        exportDir.mkdirs();
+        
+        return exportPath;
+    }
+
+    /**
+     * Exports the detected face rectangle region as an image to disk.
+     */
+    private static void exportFaceRectangle(Mat image, Rect faceRect, String originalImagePath) {
+        try {
+            // Extract the face region from the original image
+            Mat faceRegion = new Mat(image, faceRect);
+            
+            // Generate output filename
+            File originalFile = new File(originalImagePath);
+            String baseName = originalFile.getName();
+            
+            // Get export folder path
+            String exportFolder = getExportFolderPath(originalImagePath, "face_rectangles");
+            String outputPath = exportFolder + File.separator + baseName;
+            
+            // Save the face region
+            opencv_imgcodecs.imwrite(outputPath, faceRegion);
+            System.out.println("Exported face rectangle to: " + outputPath);
+            
+            faceRegion.release();
+        } catch (Exception e) {
+            System.err.println("Failed to export face rectangle: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Exports the final processed array (CHW format) as an image to disk.
+     * Converts from CHW normalized float array back to HWC Mat and denormalizes.
+     */
+    private static void exportFinalArray(float[] chwArray, String originalImagePath) {
+        try {
+            // Convert CHW array back to HWC Mat
+            // Array format: [C*H*W] where data is organized as [channel][row][col]
+            Mat hwcMat = new Mat(TARGET_HEIGHT, TARGET_WIDTH, opencv_core.CV_32FC3);
+            FloatIndexer indexer = hwcMat.createIndexer();
+            
+            int c = CHANNELS;
+            int h = TARGET_HEIGHT;
+            int w = TARGET_WIDTH;
+            
+            // Convert from CHW to HWC
+            for (int row = 0; row < h; row++) {
+                for (int col = 0; col < w; col++) {
+                    for (int ch = 0; ch < c; ch++) {
+                        int chwIdx = ch * h * w + row * w + col;
+                        indexer.put(row, col, ch, chwArray[chwIdx]);
+                    }
+                }
+            }
+            indexer.close();
+            
+            // Denormalize: reverse (pixel - 127.5) / 128.0
+            // pixel = normalized * 128.0 + 127.5
+            Mat denormalized = new Mat();
+            hwcMat.convertTo(denormalized, opencv_core.CV_8UC3, 128.0, 127.5);
+            
+            // Generate output filename
+            File originalFile = new File(originalImagePath);
+            String baseName = originalFile.getName();
+            
+            // Get export folder path
+            String exportFolder = getExportFolderPath(originalImagePath, "final_processed");
+            String outputPath = exportFolder + File.separator + baseName;
+            
+            // Save the denormalized image
+            opencv_imgcodecs.imwrite(outputPath, denormalized);
+            System.out.println("Exported final processed array to: " + outputPath);
+            
+            hwcMat.release();
+            denormalized.release();
+        } catch (Exception e) {
+            System.err.println("Failed to export final array: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 }

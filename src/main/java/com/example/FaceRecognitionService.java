@@ -98,7 +98,32 @@ public class FaceRecognitionService implements AutoCloseable {
             // Calculate average embedding for this person
             Photo averagePhoto = calculateAverageEmbedding(personName, personPhotos);
             averageVectors.put(personName, averagePhoto);
-            System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName);
+            
+            // Debug: Calculate intra-person similarity (how similar are photos of the same person?)
+            if (personPhotos.size() > 1) {
+                double minSim = 1.0, maxSim = 0.0, avgSim = 0.0;
+                int comparisons = 0;
+                for (int i = 0; i < personPhotos.size(); i++) {
+                    for (int j = i + 1; j < personPhotos.size(); j++) {
+                        double sim = personPhotos.get(i).cosineSimilarity(personPhotos.get(j));
+                        minSim = Math.min(minSim, sim);
+                        maxSim = Math.max(maxSim, sim);
+                        avgSim += sim;
+                        comparisons++;
+                    }
+                }
+                if (comparisons > 0) {
+                    avgSim /= comparisons;
+                    System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName + 
+                                     " (intra-person similarity: min=" + String.format("%.4f", minSim) + 
+                                     ", avg=" + String.format("%.4f", avgSim) + 
+                                     ", max=" + String.format("%.4f", maxSim) + ")");
+                } else {
+                    System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName);
+                }
+            } else {
+                System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName);
+            }
         }
 
         return averageVectors;
@@ -258,14 +283,22 @@ public class FaceRecognitionService implements AutoCloseable {
 
     // ===== MAIN METHOD - Everything happens here =====
     public static void main(String[] args) throws Exception {
-        String modelPath = "/Users/Arya/FaceRecognition/models/arcface.onnx";            
+        String modelPath = "/Users/Arya/FaceRecognition/models/webface_r50_pfc.onnx";         
         String cascadePath = "/Users/Arya/FaceRecognition/models/haarcascade_frontalface_default.xml"; // Download from OpenCV
         String referenceFolderPath = "/Users/Arya/FaceRecognition/ReferencePhotos";
-        String inputPhotoPath = "/Users/Arya/Downloads/arya1.jpg";
+        String inputPhotoPath = "/Users/Arya/Downloads/aayush1.jpg";
 
         // Initialize face detector FIRST
+        // Option 1: Use XML Cascade (simpler, less accurate - currently active)
         System.out.println("Initializing face detector...");
         ImagePreprocessor.initFaceDetector(cascadePath);
+        
+        // Option 2: Use ONNX RetinaFace (more accurate - needs proper anchor decoding)
+        // The RetinaFace model outputs feature maps that need anchor decoding
+        // TODO: Implement proper RetinaFace post-processing (anchor decoding + NMS)
+        // String retinaFacePath = "/Users/Arya/FaceRecognition/models/retinaface.onnx";
+        // System.out.println("Initializing RetinaFace detector...");
+        // ImagePreprocessor.initOnnxFaceDetector(retinaFacePath);
 
         // Initialize landmark detector (optional - set to null to use estimated landmarks)
         // DISABLED: Landmark detector is broken (produces invalid coordinates)
@@ -292,6 +325,21 @@ public class FaceRecognitionService implements AutoCloseable {
             System.out.println("\nProcessing input photo (detecting and cropping face)...");
             Photo inputPhoto = service.processImage(inputPhotoPath);
             System.out.println("Input: " + inputPhoto.getFileName());
+            
+            // Debug: Print embedding statistics
+            float[] inputVector = inputPhoto.getVector();
+            double inputNorm = 0.0;
+            double inputMin = Double.MAX_VALUE, inputMax = Double.MIN_VALUE;
+            for (float v : inputVector) {
+                inputNorm += v * v;
+                inputMin = Math.min(inputMin, v);
+                inputMax = Math.max(inputMax, v);
+            }
+            inputNorm = Math.sqrt(inputNorm);
+            System.out.println("Input embedding: dim=" + inputVector.length + 
+                             ", norm=" + String.format("%.4f", inputNorm) + 
+                             ", min=" + String.format("%.4f", inputMin) + 
+                             ", max=" + String.format("%.4f", inputMax));
 
             // Step 3: Find best match by comparing against average vectors
             System.out.println("\nComparing face vector against average vectors...");
@@ -301,8 +349,9 @@ public class FaceRecognitionService implements AutoCloseable {
             System.out.println("Input photo '" + inputPhoto.getFileName() +
                     "' best matches: " + bestMatch);
         } finally {
-            // Cleanup landmark detector if it was initialized
-            ImagePreprocessor.closeLandmarkDetector();
+            // Cleanup detectors
+            ImagePreprocessor.closeOnnxFaceDetector(); // If using ONNX RetinaFace
+            ImagePreprocessor.closeLandmarkDetector(); // If using landmark detector
         }
     }
 }
