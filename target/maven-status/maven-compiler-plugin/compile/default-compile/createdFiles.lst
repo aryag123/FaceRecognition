@@ -1,0 +1,7 @@
+com/example/App.class
+com/example/Photo.class
+com/example/FaceRecognitionService$MatchResult.class
+com/example/FaceRecognitionService$FaceInfo.class
+com/example/FaceRecognitionService.class
+com/example/ImagePreprocessor.class
+com/example/FaceEmbeddingModel.class
