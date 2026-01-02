@@ -2,10 +2,14 @@
 package com.example;
 
 import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import ai.onnxruntime.OrtException;
 
@@ -263,55 +267,6 @@ public class FaceRecognitionService implements AutoCloseable {
         return new Photo(personName, averageVector);
     }
 
-    @Deprecated
-    public Photo[] loadPhotosFromFolder(String folderPath) throws Exception {
-        File folder = new File(folderPath);
-
-        if (!folder.exists() || !folder.isDirectory()) {
-            throw new IllegalArgumentException("Invalid folder: " + folderPath);
-        }
-
-        File[] files = folder.listFiles();
-        if (files == null) {
-            throw new IllegalArgumentException("Cannot read folder: " + folderPath);
-        }
-
-        List<Photo> photoList = new ArrayList<>();
-
-        for (File file : files) {
-            if (!file.isFile()) {
-                continue;
-            }
-
-            // Skip hidden files (like .DS_Store on macOS)
-            if (file.getName().startsWith(".")) {
-                continue;
-            }
-
-            // Only process image files
-            String fileName = file.getName().toLowerCase();
-            if (!fileName.endsWith(".jpg") && !fileName.endsWith(".jpeg") 
-                    && !fileName.endsWith(".png") && !fileName.endsWith(".bmp")) {
-                continue;
-            }
-
-            try {
-                // Reference photos have exactly 1 face - use single face detection
-                Photo photo = processReferencePhoto(file.getAbsolutePath());
-                if (photo != null) {
-                    photoList.add(photo);
-                    System.out.println("Processed " + file.getName());
-                } else {
-                    System.err.println("No face found in " + file.getName());
-                }
-            } catch (Exception e) {
-                System.err.println("Failed to process " + file.getName() + ": " + e.getMessage());
-            }
-        }
-
-        return photoList.toArray(new Photo[0]);
-    }
-
     /**
      * Finds the best matching person by comparing input photo against average embeddings.
      * @param inputPhoto The input photo to match
@@ -342,11 +297,11 @@ public class FaceRecognitionService implements AutoCloseable {
         System.out.println("\nBest match: " + bestMatchPerson +
                 " (similarity: " + String.format("%.4f", bestSimilarity) + ")");
         
-        // Return null if similarity is below threshold (0.4 for more lenient matching)
+        // Return null if similarity is below threshold (0.325 for more lenient matching)
         // Typical face recognition thresholds: 0.5-0.6 for reasonable match, 0.7+ for confident match
-        // Using 0.4 to avoid rejecting valid faces
-        if (bestSimilarity < 0.4) {
-            System.out.println("  -> Excluded (similarity " + String.format("%.4f", bestSimilarity) + " < 0.4 threshold)");
+        // Using 0.325 to avoid rejecting valid faces
+        if (bestSimilarity < 0.325) {
+            System.out.println("  -> Excluded (similarity " + String.format("%.4f", bestSimilarity) + " < 0.325 threshold)");
             return null;
         }
         
@@ -358,7 +313,7 @@ public class FaceRecognitionService implements AutoCloseable {
      * Uses lenient matching to avoid rejecting valid faces.
      * @param inputPhoto The input photo to match
      * @param averageVectors Map of person names to their average embedding vectors
-     * @return MatchResult containing person name and similarity score, or null if similarity < 0.4
+     * @return MatchResult containing person name and similarity score, or null if similarity < 0.325
      */
     public MatchResult findBestMatchWithSimilarity(Photo inputPhoto, Map<String, Photo> averageVectors) {
         if (averageVectors == null || averageVectors.isEmpty()) {
@@ -380,10 +335,10 @@ public class FaceRecognitionService implements AutoCloseable {
             }
         }
         
-        // Return null if similarity is below threshold (0.4 for lenient matching)
+        // Return null if similarity is below threshold (0.325 for lenient matching)
         // Removed ambiguity check to avoid rejecting valid faces
-        if (bestSimilarity < 0.4) {
-            System.out.println("  -> Excluded (similarity " + String.format("%.4f", bestSimilarity) + " < 0.4 threshold)");
+        if (bestSimilarity < 0.325) {
+            System.out.println("  -> Excluded (similarity " + String.format("%.4f", bestSimilarity) + " < 0.325 threshold)");
             return null;
         }
         
@@ -409,32 +364,6 @@ public class FaceRecognitionService implements AutoCloseable {
         public double getSimilarity() {
             return similarity;
         }
-    }
-
-    @Deprecated
-    public String findBestMatch(Photo inputPhoto, Photo[] referencePhotos) {
-        if (referencePhotos == null || referencePhotos.length == 0) {
-            throw new IllegalArgumentException("No reference photos provided");
-        }
-
-        String bestMatchFileName = null;
-        double bestSimilarity = -1.0;
-
-        System.out.println("\nSimilarity scores:");
-        for (Photo reference : referencePhotos) {
-            double similarity = inputPhoto.cosineSimilarity(reference);
-            System.out.println("  " + reference.getFileName() + ": " + String.format("%.4f", similarity));
-
-            if (similarity > bestSimilarity) {
-                bestSimilarity = similarity;
-                bestMatchFileName = reference.getFileName();
-            }
-        }
-
-        System.out.println("\nBest match: " + bestMatchFileName +
-                " (similarity: " + String.format("%.4f", bestSimilarity) + ")");
-
-        return bestMatchFileName;
     }
 
     @Override
@@ -483,6 +412,276 @@ public class FaceRecognitionService implements AutoCloseable {
     }
     
     /**
+     * Adds tags (person names) directly to the input photo's metadata.
+     * Uses ExifTool to write IPTC keywords to the image file.
+     * @param imagePath Path to the input image file
+     * @param personNames List of person names to add as tags
+     */
+    private static void addTagsToImage(String imagePath, List<String> personNames) {
+        if (personNames == null || personNames.isEmpty()) {
+            return;
+        }
+        
+        try {
+            File imageFile = new File(imagePath);
+            if (!imageFile.exists()) {
+                System.err.println("Warning: Cannot add tags - image file does not exist: " + imagePath);
+                return;
+            }
+            
+            // Check if ExifTool is available
+            ProcessBuilder checkProcess = new ProcessBuilder("which", "exiftool");
+            checkProcess.redirectErrorStream(true);
+            Process checkProc = checkProcess.start();
+            
+            // Consume output to avoid blocking
+            java.io.BufferedReader checkReader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(checkProc.getInputStream()));
+            while (checkReader.readLine() != null) {
+                // Consume output
+            }
+            checkReader.close();
+            
+            int checkExit = checkProc.waitFor();
+            
+            if (checkExit != 0) {
+                System.err.println("\nWarning: ExifTool is not installed. Cannot write tags to image file.");
+                System.err.println("To install ExifTool on macOS, run: brew install exiftool");
+                System.err.println("Falling back to sidecar file...");
+                writeTagsToSidecarFile(imagePath, personNames);
+                return;
+            }
+            
+            System.out.println("  Writing tags to image file: " + imagePath);
+            
+            // Build ExifTool command to add keywords
+            // ExifTool can add multiple keywords by repeating the -Keywords option
+            List<String> command = new ArrayList<>();
+            command.add("exiftool");
+            command.add("-overwrite_original"); // Modify file in place (no backup)
+            command.add("-P"); // Preserve file modification date
+            
+            // Add each person name as a keyword
+            for (String personName : personNames) {
+                command.add("-Keywords+=" + personName); // += adds to existing keywords
+            }
+            
+            command.add(imagePath);
+            
+            // Execute ExifTool
+            System.out.println("  Executing ExifTool command...");
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            processBuilder.redirectErrorStream(true);
+            Process process = processBuilder.start();
+            
+            // Read output
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(process.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            reader.close();
+            
+            int exitCode = process.waitFor();
+            
+            if (exitCode == 0) {
+                System.out.println("  ExifTool completed successfully.");
+                if (output.length() > 0) {
+                    System.out.println("  ExifTool output: " + output.toString().trim());
+                }
+                
+                // Also add macOS Finder tags for visibility in Finder
+                System.out.println("  Adding macOS Finder tags...");
+                addMacOSFinderTags(imagePath, personNames);
+                
+                System.out.println("\n✓ Added tags to input photo: " + String.join(", ", personNames));
+                System.out.println("  Tags written to image file metadata (IPTC keywords + macOS Finder tags).");
+            } else {
+                System.err.println("ERROR: ExifTool failed to write tags. Exit code: " + exitCode);
+                if (output.length() > 0) {
+                    System.err.println("ExifTool output: " + output.toString());
+                }
+                System.err.println("Command was: " + String.join(" ", command));
+                // Fallback: write to sidecar file
+                writeTagsToSidecarFile(imagePath, personNames);
+            }
+            
+        } catch (IOException | InterruptedException e) {
+            System.err.println("Warning: Failed to add tags to image: " + e.getMessage());
+            e.printStackTrace();
+            // Fallback: write to sidecar file
+            writeTagsToSidecarFile(imagePath, personNames);
+        }
+    }
+    
+    /**
+     * Adds macOS Finder tags to the image file so they appear in Finder's right-click menu.
+     * Uses the macOS 'tag' command or 'xattr' to set Finder tags.
+     * @param imagePath Path to the input image file
+     * @param personNames List of person names to add as Finder tags
+     */
+    private static void addMacOSFinderTags(String imagePath, List<String> personNames) {
+        try {
+            // Try using the 'tag' command first (if available)
+            ProcessBuilder checkTag = new ProcessBuilder("which", "tag");
+            checkTag.redirectErrorStream(true);
+            Process checkProc = checkTag.start();
+            
+            // Consume output
+            java.io.BufferedReader checkReader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(checkProc.getInputStream()));
+            while (checkReader.readLine() != null) {
+                // Consume output
+            }
+            checkReader.close();
+            
+            int checkExit = checkProc.waitFor();
+            
+            if (checkExit == 0) {
+                // Use 'tag' command to add Finder tags
+                // The tag command expects tags as a comma-separated string: tag --add "tag1,tag2" <file>
+                List<String> tagCommand = new ArrayList<>();
+                tagCommand.add("tag");
+                tagCommand.add("--add");
+                
+                // Join all person names with commas (tag command expects comma-separated tags)
+                String tagsString = String.join(",", personNames);
+                tagCommand.add(tagsString);
+                
+                // File path comes after tags
+                tagCommand.add(imagePath);
+                
+                System.out.println("    Executing: tag --add \"" + tagsString + "\" " + imagePath);
+                ProcessBuilder tagProcess = new ProcessBuilder(tagCommand);
+                tagProcess.redirectErrorStream(true);
+                Process tagProc = tagProcess.start();
+                
+                // Read output
+                java.io.BufferedReader tagReader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(tagProc.getInputStream()));
+                StringBuilder tagOutput = new StringBuilder();
+                String tagLine;
+                while ((tagLine = tagReader.readLine()) != null) {
+                    tagOutput.append(tagLine).append("\n");
+                }
+                tagReader.close();
+                
+                int tagExit = tagProc.waitFor();
+                
+                if (tagExit == 0) {
+                    System.out.println("    macOS Finder tags command executed successfully.");
+                    if (tagOutput.length() > 0) {
+                        System.out.println("    Tag command output: " + tagOutput.toString().trim());
+                    }
+                    
+                    // Verify tags were actually added by reading them back
+                    try {
+                        ProcessBuilder verifyProcess = new ProcessBuilder("tag", "--list", imagePath);
+                        verifyProcess.redirectErrorStream(true);
+                        Process verifyProc = verifyProcess.start();
+                        java.io.BufferedReader verifyReader = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(verifyProc.getInputStream()));
+                        String verifyLine = verifyReader.readLine();
+                        verifyReader.close();
+                        verifyProc.waitFor();
+                        
+                        if (verifyLine != null) {
+                            boolean allTagsFound = true;
+                            for (String personName : personNames) {
+                                if (!verifyLine.contains(personName)) {
+                                    allTagsFound = false;
+                                    break;
+                                }
+                            }
+                            if (allTagsFound) {
+                                System.out.println("    ✓ Verified: All tags are present on file.");
+                                System.out.println("    File tags: " + verifyLine);
+                            } else {
+                                System.err.println("    ⚠ Warning: Some tags may not have been added correctly.");
+                                System.err.println("    Expected: " + String.join(", ", personNames));
+                                System.err.println("    Found: " + verifyLine);
+                            }
+                        } else {
+                            System.err.println("    ⚠ Warning: Could not verify tags (no output from tag --list).");
+                        }
+                    } catch (Exception verifyEx) {
+                        System.err.println("    ⚠ Warning: Could not verify tags: " + verifyEx.getMessage());
+                    }
+                } else {
+                    System.err.println("    ✗ ERROR: Tag command failed with exit code: " + tagExit);
+                    if (tagOutput.length() > 0) {
+                        System.err.println("    Tag command output: " + tagOutput.toString());
+                    }
+                    System.err.println("    Command was: tag --add \"" + tagsString + "\" " + imagePath);
+                }
+            } else {
+                System.err.println("    Warning: 'tag' command not found.");
+                // Fallback to xattr method
+                addMacOSFinderTagsViaXattr(imagePath, personNames);
+            }
+        } catch (Exception e) {
+            System.err.println("    Warning: Failed to add macOS Finder tags: " + e.getMessage());
+            e.printStackTrace();
+            // Try xattr method as fallback
+            try {
+                addMacOSFinderTagsViaXattr(imagePath, personNames);
+            } catch (Exception e2) {
+                System.err.println("    Warning: Failed to add Finder tags via xattr: " + e2.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Adds macOS Finder tags using xattr (extended attributes).
+     * This is a fallback method when the 'tag' command is not available.
+     * @param imagePath Path to the input image file
+     * @param personNames List of person names to add as Finder tags
+     */
+    private static void addMacOSFinderTagsViaXattr(String imagePath, List<String> personNames) {
+        try {
+            // Use tag command via xattr - this requires the tag binary
+            // For now, we'll use a simpler approach with tag command
+            // If tag command doesn't work, we'll note that Finder tags require manual setup
+            System.out.println("  Note: macOS Finder tags may require the 'tag' utility.");
+            System.out.println("  Install with: brew install tag");
+            System.out.println("  IPTC keywords are written and can be viewed with: exiftool -Keywords " + imagePath);
+        } catch (Exception e) {
+            System.err.println("Warning: Could not add Finder tags: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Fallback: Writes tags to a sidecar .tags.txt file if ExifTool is not available.
+     * @param imagePath Path to the input image file
+     * @param personNames List of person names to add as tags
+     */
+    private static void writeTagsToSidecarFile(String imagePath, List<String> personNames) {
+        try {
+            File imageFile = new File(imagePath);
+            String sidecarPath = imagePath + ".tags.txt";
+            File sidecarFile = new File(sidecarPath);
+            
+            FileWriter writer = new FileWriter(sidecarFile);
+            writer.write("# Face Recognition Tags\n");
+            writer.write("# Generated automatically by FaceRecognition system\n");
+            writer.write("# Each line below is a tag (matched person name)\n\n");
+            
+            // Write each person name as a tag (one per line)
+            for (String personName : personNames) {
+                writer.write(personName + "\n");
+            }
+            writer.close();
+            
+            System.out.println("Tags written to sidecar file: " + sidecarPath);
+        } catch (IOException e) {
+            System.err.println("Warning: Failed to write tags to sidecar file: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    /**
      * Recursively deletes a directory and all its contents.
      */
     private static void deleteDirectory(File directory) {
@@ -506,7 +705,7 @@ public class FaceRecognitionService implements AutoCloseable {
         String modelPath = "/Users/Arya/FaceRecognition/models/webface_r50_pfc.onnx";         
         String cascadePath = "/Users/Arya/FaceRecognition/models/haarcascade_frontalface_default.xml"; // Download from OpenCV
         String referenceFolderPath = "/Users/Arya/FaceRecognition/ReferencePhotos";
-        String inputPhotoPath = "/Users/Arya/FaceRecognition/InputPhotos/aryaaayush4.jpg";
+        String inputPhotosFolderPath = "/Users/Arya/FaceRecognition/InputPhotos";
 
         // Initialize face detector FIRST
         // Option 1: Use XML Cascade (currently active - more accurate for this use case)
@@ -550,93 +749,151 @@ public class FaceRecognitionService implements AutoCloseable {
                 System.out.println("  - " + personName);
             }
 
-            // Step 2: Process input photo - detects and crops all faces
-            // Input photo can have any number of faces (1, 2, 3, etc.)
-            System.out.println("\nProcessing input photo (detecting and cropping faces)...");
-            List<FaceInfo> inputFaces = service.processInputPhoto(inputPhotoPath);
-            
-            if (inputFaces.isEmpty()) {
-                System.out.println("Error: No faces detected in input photo!");
+            // Step 2: Get all image files from input photos folder
+            File inputPhotosFolder = new File(inputPhotosFolderPath);
+            if (!inputPhotosFolder.exists() || !inputPhotosFolder.isDirectory()) {
+                System.err.println("Error: Input photos folder does not exist: " + inputPhotosFolderPath);
                 return;
             }
             
-            System.out.println("Found " + inputFaces.size() + " face(s) in input photo");
+            File[] imageFiles = inputPhotosFolder.listFiles((dir, name) -> {
+                String lowerName = name.toLowerCase();
+                return lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || 
+                       lowerName.endsWith(".png") || lowerName.endsWith(".bmp");
+            });
             
-            // Note: All detected faces (including rejected ones) are already exported in detectAllFaces()
-            
-            // Step 3: Find best match for each face (exclude faces with similarity < 0.4)
-            System.out.println("\nComparing face vectors against average vectors...");
-            
-            List<MatchResult> validMatches = new ArrayList<>();
-            
-            for (int i = 0; i < inputFaces.size(); i++) {
-                FaceInfo faceInfo = inputFaces.get(i);
-                Photo inputPhoto = faceInfo.getPhoto();
-                System.out.println("\n--- Face " + faceInfo.getFaceIndex() + " ---");
-                System.out.println("Input: " + inputPhoto.getFileName());
-                
-                // Debug: Print embedding statistics
-                float[] inputVector = inputPhoto.getVector();
-                double inputNorm = 0.0;
-                double inputMin = Double.MAX_VALUE, inputMax = Double.MIN_VALUE;
-                for (float v : inputVector) {
-                    inputNorm += v * v;
-                    inputMin = Math.min(inputMin, v);
-                    inputMax = Math.max(inputMax, v);
-                }
-                inputNorm = Math.sqrt(inputNorm);
-                System.out.println("Input embedding: dim=" + inputVector.length + 
-                                 ", norm=" + String.format("%.4f", inputNorm) + 
-                                 ", min=" + String.format("%.4f", inputMin) + 
-                                 ", max=" + String.format("%.4f", inputMax));
-
-                // Find best match (returns null if similarity < 0.4)
-                String bestMatch = service.findBestMatch(inputPhoto, averageVectors);
-                
-                // Get the best match with similarity (even if < 0.4)
-                MatchResult matchResult = service.findBestMatchWithSimilarity(inputPhoto, averageVectors);
-                String exportPersonName;
-                double exportSimilarity;
-                
-                if (matchResult != null) {
-                    exportPersonName = matchResult.getPersonName();
-                    exportSimilarity = matchResult.getSimilarity();
-                } else {
-                    // No match found or similarity < 0.4
-                    exportPersonName = "Unmatched";
-                    exportSimilarity = -1.0;
-                }
-
-                if (bestMatch != null) {
-                    // Valid match (similarity >= 0.4)
-                    validMatches.add(matchResult);
-                    System.out.println("Face " + faceInfo.getFaceIndex() + " best matches: " + bestMatch + 
-                                     " (similarity: " + String.format("%.4f", matchResult.getSimilarity()) + ")");
-                } else {
-                    System.out.println("Face " + faceInfo.getFaceIndex() + " excluded (no match with similarity >= 0.4)");
-                }
-                
-                // Export all faces (matched or unmatched)
-                ImagePreprocessor.exportMatchedFace(
-                    inputPhotoPath,
-                    faceInfo.getFaceRect(),
-                    exportPersonName,
-                    faceInfo.getFaceIndex(),
-                    exportSimilarity
-                );
+            if (imageFiles == null || imageFiles.length == 0) {
+                System.err.println("Error: No image files found in input photos folder: " + inputPhotosFolderPath);
+                return;
             }
             
-            System.out.println("\n=== SUMMARY ===");
-            System.out.println("Detected " + inputFaces.size() + " face(s) in input photo");
-            System.out.println("Matched " + validMatches.size() + " face(s) (similarity >= 0.4)");
-            if (validMatches.size() > 0) {
-                System.out.println("\nValid matches:");
-                for (int i = 0; i < validMatches.size(); i++) {
-                    MatchResult match = validMatches.get(i);
-                    System.out.println("  Face " + (i + 1) + ": " + match.getPersonName() + 
-                                     " (similarity: " + String.format("%.4f", match.getSimilarity()) + ")");
+            System.out.println("\nFound " + imageFiles.length + " image file(s) in input photos folder");
+            System.out.println("================================================");
+            
+            // Process each image file
+            int totalFacesDetected = 0;
+            int totalFacesMatched = 0;
+            
+            for (int fileIndex = 0; fileIndex < imageFiles.length; fileIndex++) {
+                String inputPhotoPath = imageFiles[fileIndex].getAbsolutePath();
+                System.out.println("\n" + "=".repeat(50));
+                System.out.println("Processing image " + (fileIndex + 1) + " of " + imageFiles.length + ": " + imageFiles[fileIndex].getName());
+                System.out.println("=".repeat(50));
+                
+                // Step 3: Process input photo - detects and crops all faces
+                // Input photo can have any number of faces (1, 2, 3, etc.)
+                System.out.println("\nProcessing input photo (detecting and cropping faces)...");
+                List<FaceInfo> inputFaces = service.processInputPhoto(inputPhotoPath);
+                
+                if (inputFaces.isEmpty()) {
+                    System.out.println("  No faces detected in this photo. Skipping...");
+                    continue;
+                }
+                
+                System.out.println("  Found " + inputFaces.size() + " face(s) in this photo");
+                totalFacesDetected += inputFaces.size();
+                
+                // Note: All detected faces (including rejected ones) are already exported in detectAllFaces()
+                
+                // Step 4: Find best match for each face (exclude faces with similarity < 0.325)
+                System.out.println("\n  Comparing face vectors against average vectors...");
+                
+                List<MatchResult> validMatches = new ArrayList<>();
+                
+                for (int i = 0; i < inputFaces.size(); i++) {
+                    FaceInfo faceInfo = inputFaces.get(i);
+                    Photo inputPhoto = faceInfo.getPhoto();
+                    System.out.println("\n  --- Face " + faceInfo.getFaceIndex() + " ---");
+                    System.out.println("  Input: " + inputPhoto.getFileName());
+                    
+                    // Debug: Print embedding statistics
+                    float[] inputVector = inputPhoto.getVector();
+                    double inputNorm = 0.0;
+                    double inputMin = Double.MAX_VALUE, inputMax = Double.MIN_VALUE;
+                    for (float v : inputVector) {
+                        inputNorm += v * v;
+                        inputMin = Math.min(inputMin, v);
+                        inputMax = Math.max(inputMax, v);
+                    }
+                    inputNorm = Math.sqrt(inputNorm);
+                    System.out.println("  Input embedding: dim=" + inputVector.length + 
+                                     ", norm=" + String.format("%.4f", inputNorm) + 
+                                     ", min=" + String.format("%.4f", inputMin) + 
+                                     ", max=" + String.format("%.4f", inputMax));
+
+                    // Find best match (returns null if similarity < 0.325)
+                    String bestMatch = service.findBestMatch(inputPhoto, averageVectors);
+                    
+                    // Get the best match with similarity (even if < 0.325)
+                    MatchResult matchResult = service.findBestMatchWithSimilarity(inputPhoto, averageVectors);
+                    String exportPersonName;
+                    double exportSimilarity;
+                    
+                    if (matchResult != null) {
+                        exportPersonName = matchResult.getPersonName();
+                        exportSimilarity = matchResult.getSimilarity();
+                    } else {
+                        // No match found or similarity < 0.325
+                        exportPersonName = "Unmatched";
+                        exportSimilarity = -1.0;
+                    }
+
+                    if (bestMatch != null) {
+                        // Valid match (similarity >= 0.325)
+                        validMatches.add(matchResult);
+                        System.out.println("  Face " + faceInfo.getFaceIndex() + " best matches: " + bestMatch + 
+                                         " (similarity: " + String.format("%.4f", matchResult.getSimilarity()) + ")");
+                    } else {
+                        System.out.println("  Face " + faceInfo.getFaceIndex() + " excluded (no match with similarity >= 0.325)");
+                    }
+                    
+                    // Export all faces (matched or unmatched)
+                    ImagePreprocessor.exportMatchedFace(
+                        inputPhotoPath,
+                        faceInfo.getFaceRect(),
+                        exportPersonName,
+                        faceInfo.getFaceIndex(),
+                        exportSimilarity
+                    );
+                }
+                
+                System.out.println("\n  === SUMMARY for " + imageFiles[fileIndex].getName() + " ===");
+                System.out.println("  Detected " + inputFaces.size() + " face(s) in this photo");
+                System.out.println("  Matched " + validMatches.size() + " face(s) (similarity >= 0.325)");
+                if (validMatches.size() > 0) {
+                    System.out.println("\n  Valid matches:");
+                    for (int i = 0; i < validMatches.size(); i++) {
+                        MatchResult match = validMatches.get(i);
+                        System.out.println("    Face " + (i + 1) + ": " + match.getPersonName() + 
+                                         " (similarity: " + String.format("%.4f", match.getSimilarity()) + ")");
+                    }
+                    
+                    totalFacesMatched += validMatches.size();
+                    
+                    // Add tags to this input photo with matched person names
+                    // Collect all unique person names from all matches (works with any number of people)
+                    Set<String> uniquePersonNames = new HashSet<>();
+                    for (MatchResult match : validMatches) {
+                        uniquePersonNames.add(match.getPersonName());
+                    }
+                    
+                    if (!uniquePersonNames.isEmpty()) {
+                        System.out.println("\n  Adding tags to " + imageFiles[fileIndex].getName() + 
+                                         " for " + uniquePersonNames.size() + 
+                                         " unique person(s): " + String.join(", ", uniquePersonNames));
+                        addTagsToImage(inputPhotoPath, new ArrayList<>(uniquePersonNames));
+                    }
                 }
             }
+            
+            // Final summary across all photos
+            System.out.println("\n" + "=".repeat(50));
+            System.out.println("=== FINAL SUMMARY (All Photos) ===");
+            System.out.println("=".repeat(50));
+            System.out.println("Processed " + imageFiles.length + " image file(s)");
+            System.out.println("Total faces detected: " + totalFacesDetected);
+            System.out.println("Total faces matched: " + totalFacesMatched + " (similarity >= 0.325)");
+            
         } finally {
             // Cleanup detectors
             ImagePreprocessor.closeOnnxFaceDetector(); // If using ONNX RetinaFace
