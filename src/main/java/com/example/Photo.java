@@ -59,9 +59,4 @@ public class Photo {
 
         return dot / denominator;
     }
-
-    @Override
-    public String toString() {
-        return "Photo{fileName='" + fileName + "', vectorDim=" + vector.length + "}";
-    }
 }

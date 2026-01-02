@@ -22,9 +22,6 @@ public class ImagePreprocessor {
     public static final int CHANNELS = 3;
 
     private static CascadeClassifier faceDetector;
-    private static ONNXFaceDetector onnxFaceDetector;
-    private static FaceLandmarkDetector landmarkDetector;
-    private static boolean useOnnxDetector = false;
 
     // Initialize face detector using XML cascade (call this once at startup)
     public static void initFaceDetector(String cascadePath) {
@@ -32,37 +29,8 @@ public class ImagePreprocessor {
         if (faceDetector.empty()) {
             throw new RuntimeException("Failed to load face detector from: " + cascadePath);
         }
-        useOnnxDetector = false;
     }
 
-    // Initialize face detector using ONNX model (e.g., RetinaFace)
-    public static void initOnnxFaceDetector(String onnxModelPath) throws Exception {
-        onnxFaceDetector = new ONNXFaceDetector(onnxModelPath);
-        useOnnxDetector = true;
-    }
-
-    // Cleanup ONNX face detector
-    public static void closeOnnxFaceDetector() throws Exception {
-        if (onnxFaceDetector != null) {
-            onnxFaceDetector.close();
-            onnxFaceDetector = null;
-        }
-    }
-
-    // Initialize landmark detector (optional - if null, uses estimated landmarks)
-    public static void initLandmarkDetector(String landmarkModelPath) throws Exception {
-        if (landmarkModelPath != null && !landmarkModelPath.isEmpty()) {
-            landmarkDetector = new FaceLandmarkDetector(landmarkModelPath);
-        }
-    }
-
-    // Cleanup landmark detector
-    public static void closeLandmarkDetector() throws Exception {
-        if (landmarkDetector != null) {
-            landmarkDetector.close();
-            landmarkDetector = null;
-        }
-    }
 
     /**
      * Detects all faces in an image and returns their bounding rectangles.
@@ -127,7 +95,7 @@ public class ImagePreprocessor {
                 throw new IllegalArgumentException("No face detected in image: " + imagePath);
             }
             
-            // Align face using estimated landmarks (landmark detector is disabled due to issues)
+            // Align face using estimated landmarks based on face geometry
             Mat alignedFace = alignFace(image, faceRect);
             if (alignedFace == null) {
                 throw new IllegalArgumentException("Face alignment failed for image: " + imagePath);
@@ -205,11 +173,7 @@ public class ImagePreprocessor {
      * Returns empty list if no faces detected.
      */
     private static java.util.List<Rect> detectFaceRects(Mat image) {
-        if (useOnnxDetector) {
-            return detectFaceRectsOnnx(image);
-        } else {
-            return detectFaceRectsCascade(image);
-        }
+        return detectFaceRectsCascade(image);
     }
     
     /**
@@ -233,78 +197,10 @@ public class ImagePreprocessor {
     }
 
     /**
-     * Detects faces using ONNX model (e.g., RetinaFace) - raw detection, no filtering.
-     * Returns list of all detected faces before any filtering.
-     */
-    private static java.util.List<Rect> detectFaceRectsOnnxRaw(Mat image) {
-        if (onnxFaceDetector == null) {
-            throw new IllegalStateException("ONNX face detector not initialized. Call initOnnxFaceDetector() first.");
-        }
-
-        try {
-            java.util.List<Rect> faces = onnxFaceDetector.detectFaces(image);
-            
-            if (faces == null || faces.isEmpty()) {
-                return new java.util.ArrayList<>(); // Return empty list if no faces found
-            }
-
-            return faces; // Return raw detected faces (no filtering)
-        } catch (Exception e) {
-            // If ONNX detection fails, fall back to cascade if available
-            System.err.println("ONNX face detection failed: " + e.getMessage());
-            System.err.println("Falling back to XML cascade detector...");
-            if (faceDetector != null) {
-                return detectFaceRectsCascadeRaw(image);
-            }
-            throw new RuntimeException("ONNX face detection failed and no cascade fallback available: " + e.getMessage(), e);
-        }
-    }
-    
-    /**
-     * Detects faces using ONNX model (e.g., RetinaFace).
-     * Returns list of all detected faces (after filtering).
-     */
-    private static java.util.List<Rect> detectFaceRectsOnnx(Mat image) {
-        if (onnxFaceDetector == null) {
-            throw new IllegalStateException("ONNX face detector not initialized. Call initOnnxFaceDetector() first.");
-        }
-
-        try {
-            java.util.List<Rect> faces = onnxFaceDetector.detectFaces(image);
-            
-            if (faces == null || faces.isEmpty()) {
-                return new java.util.ArrayList<>(); // Return empty list if no faces found
-            }
-
-            // Filter out very small faces (likely false positives)
-            faces = filterSmallFaces(faces, image);
-            
-            // Filter false positives using landmark validation if available
-            if (landmarkDetector != null) {
-                faces = validateFacesWithLandmarks(image, faces);
-            }
-
-            return faces; // Return all detected faces
-        } catch (Exception e) {
-            // If ONNX detection fails, fall back to cascade if available
-            System.err.println("ONNX face detection failed: " + e.getMessage());
-            System.err.println("Falling back to XML cascade detector...");
-            if (faceDetector != null) {
-                return detectFaceRectsCascade(image);
-            }
-            throw new RuntimeException("ONNX face detection failed and no cascade fallback available: " + e.getMessage(), e);
-        }
-    }
-    
-    /**
      * Gets raw face detections (before filtering) for export purposes.
      */
     private static java.util.List<Rect> detectFaceRectsRaw(Mat image) {
-        if (useOnnxDetector) {
-            return detectFaceRectsOnnxRaw(image);
-        } else {
-            return detectFaceRectsCascadeRaw(image);
-        }
+        return detectFaceRectsCascadeRaw(image);
     }
     
     /**
@@ -431,11 +327,6 @@ public class ImagePreprocessor {
             if (faceList.size() > 1) {
                 faceList = filterOverlappingFaces(faceList);
             }
-            
-            // Filter false positives using landmark validation if available
-            if (landmarkDetector != null) {
-                faceList = validateFacesWithLandmarks(image, faceList);
-            }
 
             return faceList;
         } finally {
@@ -537,83 +428,6 @@ public class ImagePreprocessor {
     }
     
     /**
-     * Validates detected faces using landmark detection to filter false positives.
-     * Uses extremely lenient validation - keeps all faces regardless of landmark validation.
-     * This is mainly for logging purposes, not for filtering.
-     * 
-     * @param image The full image
-     * @param faces List of detected face rectangles
-     * @return All faces (validation doesn't filter anything)
-     */
-    private static java.util.List<Rect> validateFacesWithLandmarks(Mat image, java.util.List<Rect> faces) {
-        if (landmarkDetector == null || faces == null || faces.isEmpty()) {
-            return faces; // No validation possible, return as-is
-        }
-        
-        // Don't filter anything - just return all faces
-        // Landmark validation is disabled to avoid rejecting valid faces
-        return faces;
-    }
-    
-    /**
-     * Validates that detected landmarks are reasonable and within bounds.
-     * Uses extremely lenient validation - only flags completely impossible landmarks.
-     * Even if validation fails, faces are kept (this is just for logging).
-     * 
-     * @param landmarks Array of detected landmarks
-     * @param faceRect The face bounding rectangle
-     * @param image The full image
-     * @return null if landmarks are valid, or a string describing the issue if invalid (for logging only)
-     */
-    private static String getLandmarkValidationIssue(Point2f[] landmarks, Rect faceRect, Mat image) {
-        // Extremely lenient: accept any landmarks that exist
-        if (landmarks == null || landmarks.length == 0) {
-            return null; // Don't reject - landmark detection might have failed
-        }
-        
-        // Accept any number of landmarks (even just 1)
-        if (landmarks.length < 1) {
-            return null; // Don't reject
-        }
-        
-        int imgWidth = image.cols();
-        int imgHeight = image.rows();
-        
-        // Only flag if ALL landmarks are way out of bounds (extremely strict)
-        int outOfBoundsCount = 0;
-        for (Point2f landmark : landmarks) {
-            // Very generous bounds check (50% outside image)
-            if (landmark.x() < -imgWidth * 0.5 || landmark.x() > imgWidth * 1.5 ||
-                landmark.y() < -imgHeight * 0.5 || landmark.y() > imgHeight * 1.5) {
-                outOfBoundsCount++;
-            }
-        }
-        
-        // Only flag if ALL landmarks are way out of bounds
-        if (outOfBoundsCount == landmarks.length && landmarks.length > 0) {
-            return "all landmarks way out of bounds (" + outOfBoundsCount + "/" + landmarks.length + ")";
-        }
-        
-        // For 5-point models: only check for completely impossible configurations
-        if (landmarks.length >= 5) {
-            Point2f leftEye = landmarks[0];
-            Point2f rightEye = landmarks[1];
-            Point2f nose = landmarks[2];
-            Point2f leftMouth = landmarks[3];
-            Point2f rightMouth = landmarks[4];
-            
-            // Only flag if eyes are at exactly the same position (distance < 1 pixel)
-            double eyeDistance = Math.sqrt(Math.pow(leftEye.x() - rightEye.x(), 2) + 
-                                          Math.pow(leftEye.y() - rightEye.y(), 2));
-            if (eyeDistance < 1.0) { // Eyes at same position (impossible)
-                return "eyes at same position (distance: " + String.format("%.1f", eyeDistance) + ")";
-            }
-        }
-        
-        return null; // All checks passed - landmarks are valid (or acceptable)
-    }
-
-    /**
      * Aligns face to standard ArcFace template using similarity transform.
      * Standard template landmarks (for 112x112 image):
      * - Left eye: (30.2946, 51.6963)
@@ -623,43 +437,15 @@ public class ImagePreprocessor {
      * - Right mouth: (62.7299, 92.2041)
      */
     private static Mat alignFace(Mat image, Rect faceRect) {
-        Point2f leftEye, rightEye;
+        // Use estimated landmarks based on face geometry
+        // Eyes are typically at about 30-40% from top of face
+        // Eye separation is typically 30-40% of face width
+        float eyeY = faceRect.y() + faceRect.height() * 0.35f;  // 35% from top
+        float eyeDistance = faceRect.width() * 0.38f;  // 38% of face width
+        float centerX = faceRect.x() + faceRect.width() / 2.0f;
         
-        // DISABLED: Landmark-based alignment causes incorrect matches
-        // The landmark detector produces unreliable coordinates that cause bad alignment,
-        // making all faces look similar. Using estimated landmarks instead for better accuracy.
-        // 
-        // If you want to re-enable landmark-based alignment, uncomment the code below
-        // and ensure the landmark detector produces accurate, consistent results.
-        
-        /*
-        // Try to detect real landmarks if landmark detector is available
-        if (landmarkDetector != null) {
-            try {
-                Point2f[] landmarks = landmarkDetector.detectLandmarks(image, faceRect);
-                // ... landmark detection code ...
-            } catch (Exception e) {
-                // Fall back to estimated landmarks if detection fails
-            }
-        }
-        */
-        
-        // Always use estimated landmarks (more reliable than detected landmarks)
-        leftEye = null;
-        rightEye = null;
-        
-        // Use estimated landmarks
-        if (leftEye == null || rightEye == null) {
-            // Better estimation: use face geometry
-            // Eyes are typically at about 30-40% from top of face
-            // Eye separation is typically 30-40% of face width
-            float eyeY = faceRect.y() + faceRect.height() * 0.35f;  // 35% from top
-            float eyeDistance = faceRect.width() * 0.38f;  // 38% of face width
-            float centerX = faceRect.x() + faceRect.width() / 2.0f;
-            
-            leftEye = new Point2f(centerX - eyeDistance / 2.0f, eyeY);
-            rightEye = new Point2f(centerX + eyeDistance / 2.0f, eyeY);
-        }
+        Point2f leftEye = new Point2f(centerX - eyeDistance / 2.0f, eyeY);
+        Point2f rightEye = new Point2f(centerX + eyeDistance / 2.0f, eyeY);
         
         // Standard template landmarks (normalized to 112x112)
         Point2f templateLeftEye = new Point2f(30.2946f, 51.6963f);
@@ -745,59 +531,6 @@ public class ImagePreprocessor {
         return chwData;
     }
 
-    /**
-     * Exports a detected face from input photo to the DetectedFaces folder.
-     * @param imagePath Path to the original input image
-     * @param faceRect The face rectangle to export
-     * @param faceIndex The index of the face (1-based)
-     */
-    public static void exportDetectedFace(String imagePath, Rect faceRect, int faceIndex) {
-        try {
-            // Load the original image
-            Mat image = opencv_imgcodecs.imread(imagePath);
-            if (image.empty()) {
-                System.err.println("Failed to load image for export: " + imagePath);
-                return;
-            }
-            
-            try {
-                // Extract the face region from the original image
-                Mat faceRegion = new Mat(image, faceRect);
-                
-            // Use absolute path to ensure folder is created
-            String exportFolder = "/Users/Arya/FaceRecognition/DetectedFaces";
-            File exportDir = new File(exportFolder);
-            if (!exportDir.exists()) {
-                boolean created = exportDir.mkdirs();
-                if (!created) {
-                    System.err.println("    Warning: Failed to create DetectedFaces folder: " + exportFolder);
-                } else {
-                    System.out.println("    Created DetectedFaces folder: " + exportFolder);
-                }
-            }
-            
-            // Generate filename: originalName_faceN.jpg
-            File imageFile = new File(imagePath);
-            String baseName = imageFile.getName();
-                String nameWithoutExt = baseName.replaceFirst("\\.[^.]+$", "");
-                String ext = baseName.substring(baseName.lastIndexOf('.'));
-                String outputFileName = String.format("%s_face%d%s", nameWithoutExt, faceIndex, ext);
-                String outputPath = exportFolder + File.separator + outputFileName;
-                
-                // Save the face region
-                opencv_imgcodecs.imwrite(outputPath, faceRegion);
-                System.out.println("  Exported detected face to: " + outputPath);
-                
-                faceRegion.release();
-            } finally {
-                image.release();
-            }
-        } catch (Exception e) {
-            System.err.println("Failed to export detected face: " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
-    
     /**
      * Exports a face from input photo to the MatchedFaces folder.
      * @param imagePath Path to the original input image

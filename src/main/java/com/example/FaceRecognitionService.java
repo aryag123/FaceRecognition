@@ -194,30 +194,7 @@ public class FaceRecognitionService implements AutoCloseable {
             averageVectors.put(personName, averagePhoto);
             
             // Debug: Calculate intra-person similarity (how similar are photos of the same person?)
-            if (personPhotos.size() > 1) {
-                double minSim = 1.0, maxSim = 0.0, avgSim = 0.0;
-                int comparisons = 0;
-                for (int i = 0; i < personPhotos.size(); i++) {
-                    for (int j = i + 1; j < personPhotos.size(); j++) {
-                        double sim = personPhotos.get(i).cosineSimilarity(personPhotos.get(j));
-                        minSim = Math.min(minSim, sim);
-                        maxSim = Math.max(maxSim, sim);
-                        avgSim += sim;
-                        comparisons++;
-                    }
-                }
-                if (comparisons > 0) {
-                    avgSim /= comparisons;
-                    System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName + 
-                                     " (intra-person similarity: min=" + String.format("%.4f", minSim) + 
-                                     ", avg=" + String.format("%.4f", avgSim) + 
-                                     ", max=" + String.format("%.4f", maxSim) + ")");
-                } else {
-                    System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName);
-                }
-            } else {
-                System.out.println("    Averaged " + personPhotos.size() + " photos for " + personName);
-            }
+            
         }
 
         return averageVectors;
@@ -707,32 +684,9 @@ public class FaceRecognitionService implements AutoCloseable {
         String referenceFolderPath = "/Users/Arya/FaceRecognition/ReferencePhotos";
         String inputPhotosFolderPath = "/Users/Arya/FaceRecognition/InputPhotos";
 
-        // Initialize face detector FIRST
-        // Option 1: Use XML Cascade (currently active - more accurate for this use case)
+        // Initialize face detector
         System.out.println("Initializing face detector...");
         ImagePreprocessor.initFaceDetector(cascadePath);
-        
-        // Option 2: Use ONNX RetinaFace (anchor decoding needs refinement)
-        // String retinaFacePath = "/Users/Arya/FaceRecognition/models/retinaface.onnx";
-        // System.out.println("Initializing RetinaFace detector...");
-        // ImagePreprocessor.initOnnxFaceDetector(retinaFacePath);
-
-        // Initialize landmark detector for false positive filtering
-        // The landmark detector will validate detected faces and filter out false positives
-        String landmarkModelPath = "/Users/Arya/FaceRecognition/models/Facial-Landmark-Detection.onnx";
-        if (landmarkModelPath != null && !landmarkModelPath.isEmpty()) {
-            System.out.println("Initializing landmark detector for false positive filtering...");
-            try {
-                ImagePreprocessor.initLandmarkDetector(landmarkModelPath);
-                System.out.println("Landmark detector initialized successfully. False positive filtering enabled.");
-            } catch (Exception e) {
-                System.err.println("Warning: Failed to initialize landmark detector: " + e.getMessage());
-                System.err.println("Continuing without landmark-based false positive filtering...");
-                landmarkModelPath = null; // Disable if initialization fails
-            }
-        } else {
-            System.out.println("No landmark detector model specified - false positive filtering disabled");
-        }
 
         try (FaceRecognitionService service = new FaceRecognitionService(modelPath)) {
 
@@ -894,10 +848,6 @@ public class FaceRecognitionService implements AutoCloseable {
             System.out.println("Total faces detected: " + totalFacesDetected);
             System.out.println("Total faces matched: " + totalFacesMatched + " (similarity >= 0.325)");
             
-        } finally {
-            // Cleanup detectors
-            ImagePreprocessor.closeOnnxFaceDetector(); // If using ONNX RetinaFace
-            ImagePreprocessor.closeLandmarkDetector(); // If using landmark detector
         }
     }
 }
